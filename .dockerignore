@@ -1,5 +1,7 @@
 .git
-.env
+.env*
+.venv
+.vercel
 data
 test-results
 __pycache__

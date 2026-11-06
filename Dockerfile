@@ -6,6 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PORT=8000 \
     DATABASE_PATH=/data/aqua.sqlite3
 COPY app.py ./
+COPY database.py ./
 COPY static/ ./static/
 RUN mkdir -p /data
 EXPOSE 8000

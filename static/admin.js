@@ -115,7 +115,7 @@ async function boot(){
   try {const session=await api('/api/session');csrf=session.csrf;initialized=session.initialized;
     if(session.authenticated)return await showApp();
     $('#auth-screen').hidden=false;
-    if(!initialized){$('#auth-title').textContent='建立你的管理中心';$('#auth-description').textContent=session.local_setup?'首次使用，請建立唯一的管理員帳號。密碼至少 12 個字元。':'請先在伺服器執行 python3 app.py --create-admin 建立管理員。';$('#auth-submit').textContent='建立管理員 ↗';$('#auth-form').elements.password.autocomplete='new-password';$('#auth-form').elements.password.minLength=12;if(!session.local_setup)$('#auth-submit').disabled=true;}
+    if(!initialized){$('#auth-title').textContent='建立你的管理中心';$('#auth-description').textContent=session.local_setup?'首次使用，請建立唯一的管理員帳號。密碼至少 12 個字元。':'請先在託管平台設定 ADMIN_USERNAME 和 ADMIN_PASSWORD，再重新部署。';$('#auth-submit').textContent='建立管理員 ↗';$('#auth-form').elements.password.autocomplete='new-password';$('#auth-form').elements.password.minLength=12;if(!session.local_setup)$('#auth-submit').disabled=true;}
   }catch(error){$('#auth-screen').hidden=false;$('#auth-error').textContent=error.message;}
 }
 $('#auth-form').addEventListener('submit',async event=>{event.preventDefault();const button=$('#auth-submit');button.disabled=true;$('#auth-error').textContent='';const body=Object.fromEntries(new FormData(event.currentTarget));try{if(!initialized){await api('/api/setup',body);initialized=true;}const result=await api('/api/login',body);csrf=result.csrf;event.target.reset();await showApp();}catch(error){$('#auth-error').textContent=error.message;}finally{button.disabled=false;}});

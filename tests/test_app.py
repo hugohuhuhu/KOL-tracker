@@ -18,7 +18,6 @@ class TrackerTest(unittest.TestCase):
         self.old_db = app.DB_PATH
         app.DB_PATH = Path(self.temp.name) / 'test.sqlite3'
         app.initialize()
-        app.ATTEMPTS.clear()
         self.server = app.ThreadingHTTPServer(('127.0.0.1', 0), app.Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()

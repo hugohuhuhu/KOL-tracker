@@ -1,0 +1,7 @@
+.git
+.venv
+.vercel
+data
+test-results
+tests
+.env*

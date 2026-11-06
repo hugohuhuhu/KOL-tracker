@@ -1,4 +1,4 @@
-"""Aqua Planet referral tracker. Python 3.12+, no third-party dependencies."""
+"""Aqua Planet referral tracker with SQLite or PostgreSQL persistence."""
 import argparse
 import csv
 import getpass
@@ -18,9 +18,11 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlsplit
+from database import INTEGRITY_ERRORS, PostgresConnection
 
 ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get('DATABASE_PATH', ROOT / 'data' / 'aqua.sqlite3'))
+DATABASE_URL = os.environ.get('DATABASE_URL') or os.environ.get('POSTGRES_URL')
 PLATFORMS = ('facebook', 'instagram', 'website', 'kkday', 'klook')
 DEFAULT_LINKS = {
     'facebook': 'https://www.facebook.com/search/top/?q=aqua%20planet',
@@ -30,14 +32,18 @@ DEFAULT_LINKS = {
     'klook': 'https://www.klook.com/zh-TW/activity/18285-aqua-planet-pass-subic-clark/?spm=SearchResult.SearchResult_LIST&clickId=d74da8f078',
 }
 LOCK = threading.Lock()
-ATTEMPTS = {}
 
 
 @contextmanager
 def db():
-    conn = sqlite3.connect(DB_PATH, timeout=15)
-    conn.row_factory = sqlite3.Row
-    conn.execute('PRAGMA foreign_keys=ON')
+    if DATABASE_URL:
+        conn = PostgresConnection(DATABASE_URL)
+    else:
+        if os.environ.get('VERCEL'):
+            raise RuntimeError('Vercel requires a persistent DATABASE_URL or POSTGRES_URL.')
+        conn = sqlite3.connect(DB_PATH, timeout=15)
+        conn.row_factory = sqlite3.Row
+        conn.execute('PRAGMA foreign_keys=ON')
     try:
         with conn:
             yield conn
@@ -50,9 +56,12 @@ def now():
 
 
 def initialize():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if not DATABASE_URL:
+        if os.environ.get('VERCEL'):
+            raise RuntimeError('Configure DATABASE_URL before deploying on Vercel.')
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with db() as c:
-        c.executescript('''
+        schema = '''
         PRAGMA journal_mode=WAL;
         CREATE TABLE IF NOT EXISTS admin(id INTEGER PRIMARY KEY CHECK(id=1), username TEXT NOT NULL, salt TEXT NOT NULL, password TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, csrf TEXT NOT NULL, expires REAL NOT NULL);
@@ -61,9 +70,16 @@ def initialize():
         CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, referral_id INTEGER NOT NULL REFERENCES referrals(id), kind TEXT NOT NULL, destination TEXT, visitor TEXT NOT NULL, created_at TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS events_date ON events(created_at, referral_id);
         CREATE INDEX IF NOT EXISTS events_referral ON events(referral_id, kind, visitor);
-        ''')
-        c.execute('INSERT OR IGNORE INTO settings VALUES(1,?)', (json.dumps(dict(title='Aqua Planet', subtitle='把日常留在岸上。一起跳進菲律賓克拉克的陽光與浪花。', public_url='', **DEFAULT_LINKS)),))
-    os.chmod(DB_PATH, 0o600)
+        CREATE TABLE IF NOT EXISTS login_attempts(key TEXT PRIMARY KEY, failures INTEGER NOT NULL, window_start REAL NOT NULL);
+        '''
+        if DATABASE_URL:
+            c.execute('SELECT pg_advisory_xact_lock(1840253301)')
+            schema = schema.replace('PRAGMA journal_mode=WAL;', '').replace('id INTEGER PRIMARY KEY,', 'id SERIAL PRIMARY KEY,').replace(' COLLATE NOCASE', '').replace('expires REAL', 'expires DOUBLE PRECISION').replace('window_start REAL', 'window_start DOUBLE PRECISION')
+            schema += 'CREATE UNIQUE INDEX IF NOT EXISTS referrals_code_lower ON referrals(lower(code));'
+        c.executescript(schema)
+        c.execute('INSERT INTO settings VALUES(1,?) ON CONFLICT(id) DO NOTHING', (json.dumps(dict(title='Aqua Planet', subtitle='把日常留在岸上。一起跳進菲律賓克拉克的陽光與浪花。', public_url='', **DEFAULT_LINKS)),))
+    if not DATABASE_URL:
+        os.chmod(DB_PATH, 0o600)
 
 
 def password_hash(password, salt):
@@ -88,7 +104,13 @@ def bootstrap_admin():
             return
     username, password = os.environ.get('ADMIN_USERNAME'), os.environ.get('ADMIN_PASSWORD')
     if username is not None or password is not None:
-        create_admin(username, password)
+        try:
+            create_admin(username, password)
+        except INTEGRITY_ERRORS:
+            # Another cold-start worker may have created the singleton admin.
+            with db() as c:
+                if not c.execute('SELECT 1 FROM admin').fetchone():
+                    raise
 
 
 def settings(c):
@@ -154,6 +176,9 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError('無效的請求格式。')
         return data
 
+    def local_setup_allowed(self):
+        return not os.environ.get('VERCEL') and self.client_address[0] in ('127.0.0.1', '::1')
+
     def do_GET(self):
         try:
             self.get_route()
@@ -183,11 +208,11 @@ class Handler(BaseHTTPRequestHandler):
             session = self.session()
             with db() as c:
                 initialized = bool(c.execute('SELECT 1 FROM admin').fetchone())
-            return self.respond(200, {'authenticated': bool(session), 'csrf': session['csrf'] if session else '', 'initialized': initialized, 'local_setup': self.client_address[0] in ('127.0.0.1', '::1')})
+            return self.respond(200, {'authenticated': bool(session), 'csrf': session['csrf'] if session else '', 'initialized': initialized, 'local_setup': self.local_setup_allowed()})
         if path == '/api/public':
             code = parse_qs(url.query).get('code', [''])[0]
             with db() as c:
-                ref = c.execute('SELECT code FROM referrals WHERE code=? AND active=1', (code,)).fetchone() if code else None
+                ref = c.execute('SELECT code FROM referrals WHERE lower(code)=lower(?) AND active=1', (code,)).fetchone() if code else None
                 if code and not ref:
                     return self.error(404, '這個推薦連結不存在或已停用。')
                 config = settings(c)
@@ -195,7 +220,7 @@ class Handler(BaseHTTPRequestHandler):
         match = re.fullmatch(r'/r/([A-Za-z0-9_-]{3,40})', path)
         if match:
             with db() as c:
-                ref = c.execute('SELECT * FROM referrals WHERE code=? AND active=1', (match[1],)).fetchone()
+                ref = c.execute('SELECT * FROM referrals WHERE lower(code)=lower(?) AND active=1', (match[1],)).fetchone()
                 if not ref:
                     return self.respond(404, '推薦連結不存在或已停用。', 'text/plain; charset=utf-8')
                 visitor, headers = self.record(c, ref['id'], 'visit', None)
@@ -210,7 +235,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self.error(404, '這個平台的連結尚未開放。')
                 headers = []
                 if code != '_direct':
-                    ref = c.execute('SELECT * FROM referrals WHERE code=? AND active=1', (code,)).fetchone()
+                    ref = c.execute('SELECT * FROM referrals WHERE lower(code)=lower(?) AND active=1', (code,)).fetchone()
                     if not ref:
                         return self.error(404, '推薦連結不存在或已停用。')
                     _, headers = self.record(c, ref['id'], 'click', destination)
@@ -266,7 +291,8 @@ class Handler(BaseHTTPRequestHandler):
         totals = c.execute('''SELECT COUNT(CASE WHEN kind='visit' THEN 1 END) visits,
             COUNT(DISTINCT CASE WHEN kind='visit' THEN visitor END) unique_visitors,
             COUNT(CASE WHEN kind='click' THEN 1 END) clicks FROM events WHERE created_at>=?''', (since,)).fetchone()
-        daily = c.execute("SELECT date(created_at,'+8 hours') day, COUNT(CASE WHEN kind='visit' THEN 1 END) visits, COUNT(CASE WHEN kind='click' THEN 1 END) clicks FROM events WHERE created_at>=? GROUP BY day ORDER BY day", (since,)).fetchall()
+        day_sql = "to_char(created_at::timestamptz AT TIME ZONE 'Asia/Taipei','YYYY-MM-DD')" if DATABASE_URL else "date(created_at,'+8 hours')"
+        daily = c.execute(f'''SELECT {day_sql} AS "day", COUNT(CASE WHEN kind='visit' THEN 1 END) visits, COUNT(CASE WHEN kind='click' THEN 1 END) clicks FROM events WHERE created_at>=? GROUP BY "day" ORDER BY "day"''', (since,)).fetchall()
         config = settings(c)
         return {'referrals': [dict(r) for r in rows], 'totals': dict(totals), 'daily': [dict(r) for r in daily], 'days': days, 'public_url': config['public_url'], 'configured_platforms': len([p for p in PLATFORMS if config[p]]), 'today': str(today)}
 
@@ -278,8 +304,8 @@ class Handler(BaseHTTPRequestHandler):
             data = self.read_body()
             path = urlsplit(self.path).path
             if path == '/api/setup':
-                if self.client_address[0] not in ('127.0.0.1', '::1'):
-                    return self.error(403, '請先在伺服器執行 python3 app.py --create-admin 建立管理員。')
+                if not self.local_setup_allowed():
+                    return self.error(403, '請先在託管平台設定 ADMIN_USERNAME 和 ADMIN_PASSWORD，再重新部署。')
                 with LOCK:
                     with db() as c:
                         if c.execute('SELECT 1 FROM admin').fetchone():
@@ -288,12 +314,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(201, {'ok': True})
             if path == '/api/login':
                 ip = self.client_address[0]
-                with LOCK:
-                    attempts = [t for t in ATTEMPTS.get(ip, []) if t > time.time() - 900]
-                    if len(attempts) >= 10:
-                        return self.error(429, '登入嘗試過多，請 15 分鐘後再試。')
-                    attempts.append(time.time())
-                    ATTEMPTS[ip] = attempts
+                attempt_key = hashlib.sha256(('aqua-login:' + ip).encode()).hexdigest()
+                timestamp = time.time()
+                with db() as c:
+                    c.execute('DELETE FROM login_attempts WHERE window_start<?', (timestamp - 900,))
+                    attempts = c.execute('''INSERT INTO login_attempts(key,failures,window_start) VALUES(?,1,?)
+                        ON CONFLICT(key) DO UPDATE SET failures=login_attempts.failures+1 RETURNING failures''', (attempt_key, timestamp)).fetchone()[0]
+                if attempts > 10:
+                    return self.error(429, '登入嘗試過多，請 15 分鐘後再試。')
                 with db() as c:
                     admin = c.execute('SELECT * FROM admin').fetchone()
                     password = data.get('password', '')
@@ -305,8 +333,7 @@ class Handler(BaseHTTPRequestHandler):
                     token, csrf = secrets.token_hex(32), secrets.token_hex(32)
                     c.execute('DELETE FROM sessions WHERE expires<?', (time.time(),))
                     c.execute('INSERT INTO sessions VALUES(?,?,?)', (hashlib.sha256(token.encode()).hexdigest(), csrf, time.time() + 12 * 3600))
-                with LOCK:
-                    ATTEMPTS.pop(ip, None)
+                    c.execute('DELETE FROM login_attempts WHERE key=?', (attempt_key,))
                 return self.respond(200, {'csrf': csrf}, headers=[self.set_cookie('aqua_session', token, 12 * 3600)])
             session = self.session()
             if not session:
@@ -353,7 +380,7 @@ class Handler(BaseHTTPRequestHandler):
                             return self.error(404, '找不到這個推薦碼。')
                 return self.respond(201 if path == '/api/referrals' else 200, {'id': ref_id})
             self.error(404, '找不到這個功能。')
-        except sqlite3.IntegrityError:
+        except INTEGRITY_ERRORS:
             self.error(409, '這個推薦碼已經存在，請換一個。')
         except (ValueError, TypeError, AttributeError) as exc:
             self.error(400, str(exc) if isinstance(exc, ValueError) else '請檢查輸入格式。')
@@ -375,7 +402,7 @@ def main():
             raise SystemExit('密碼不一致。')
         try:
             create_admin(username, password)
-        except (ValueError, sqlite3.IntegrityError) as exc:
+        except (ValueError, *INTEGRITY_ERRORS) as exc:
             raise SystemExit('無法建立管理員：' + str(exc))
         print('管理員已建立。')
         return
